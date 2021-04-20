@@ -86,46 +86,6 @@ static DECLARE_WAIT_QUEUE_HEAD(proc_poll_wait);
 /* Activity counter to indicate that a swapon or swapoff has occurred */
 static atomic_t proc_poll_event = ATOMIC_INIT(0);
 
-#ifdef CONFIG_ZNDSWAP
-/*
- * The principle of this function is to mitigate memory pressure(might be caused by in-RAM swap).
- * If low first, return true, else, return false.
- */
-static bool dynamic_swap_selection(void)
-{
-	int file_cache_threshold, swap_cache_size, wb, free_threshold;
-
-	/* If there is only 1 swapfile, never fall through */
-	if (nr_swapfiles < 2)
-		return false;
-
-	/* Get the size of swapcache for judgement */
-	swap_cache_size = total_swapcache_pages();
-
-	/* Is swapcache/wb too high? It implies some congestion may happen in storage */
-	wb = global_page_state(NR_WRITEBACK);
-	if (swap_cache_size > dt_swapcache && wb > dt_writeback)
-		return false;
-	else
-		return true;
-
-	/* Is the size of cache memory < 1/8 kernel manageable memory - minimum working set */
-	file_cache_threshold = (global_page_state(NR_FILE_PAGES) - global_page_state(NR_SHMEM) - swap_cache_size) << 3;
-	if (file_cache_threshold < dt_filecache)
-		return true;
-
-	/* Is there too few free memory */
-	free_threshold = global_page_state(NR_FREE_PAGES);
-	if (free_threshold <= dt_watermark)
-		return true;
-
-	/* Default: No dynamic swap selection */
-	return false;
-}
-#else /* CONFIG_ZNDSWAP */
-#define dynamic_swap_selection()	(false)
-#endif
-
 static inline unsigned char swap_count(unsigned char ent)
 {
 	return ent & ~SWAP_HAS_CACHE;	/* may include SWAP_HAS_CONT flag */
@@ -680,7 +640,6 @@ swp_entry_t get_swap_page(void)
 {
 	struct swap_info_struct *si, *next;
 	pgoff_t offset;
-	bool low_prio_first = false, low_prio_tried = false;
 
 	if (atomic_long_read(&nr_swap_pages) <= 0)
 		goto noswap;
@@ -688,18 +647,8 @@ swp_entry_t get_swap_page(void)
 
 	spin_lock(&swap_avail_lock);
 
-	/* Check whether it should be low priority first */
-	low_prio_first = dynamic_swap_selection();
-
 start_over:
 	plist_for_each_entry_safe(si, next, &swap_avail_head, avail_list) {
-
-		/* If low prio first, check the next si */
-		if (low_prio_first && !low_prio_tried) {
-			low_prio_tried = true;
-			goto nextsi;
-		}
-
 		/* requeue si to after same-priority siblings */
 		plist_requeue(&si->avail_list, &swap_avail_head);
 		spin_unlock(&swap_avail_lock);
@@ -744,13 +693,6 @@ nextsi:
 			goto start_over;
 	}
 
-	/* If no entry found, try again */
-	if (low_prio_tried) {
-		/* Reset low_prio_* to avoid infinite loop */
-		low_prio_first = low_prio_tried = false;
-		goto start_over;
-	}
-
 	spin_unlock(&swap_avail_lock);
 
 	atomic_long_inc(&nr_swap_pages);
@@ -780,9 +722,7 @@ swp_entry_t get_swap_page_of_type(int type)
 	return (swp_entry_t) {0};
 }
 
-/* M for pswap interface */
-/* static struct swap_info_struct *swap_info_get(swp_entry_t entry)*/
-struct swap_info_struct *swap_info_get(swp_entry_t entry)
+static struct swap_info_struct *swap_info_get(swp_entry_t entry)
 {
 	struct swap_info_struct *p;
 	unsigned long offset, type;
@@ -816,12 +756,6 @@ bad_nofile:
 	pr_err("swap_free: %s%08lx\n", Bad_file, entry.val);
 out:
 	return NULL;
-}
-
-/* M for pswap interface */
-void swap_info_unlock(struct swap_info_struct *si)
-{
-	spin_unlock(&si->lock);
 }
 
 static unsigned char swap_entry_free(struct swap_info_struct *p,
@@ -937,6 +871,48 @@ int page_swapcount(struct page *page)
 		count = swap_count(p->swap_map[swp_offset(entry)]);
 		spin_unlock(&p->lock);
 	}
+	return count;
+}
+
+/*
+ * How many references to @entry are currently swapped out?
+ * This considers COUNT_CONTINUED so it returns exact answer.
+ */
+int swp_swapcount(swp_entry_t entry)
+{
+	int count, tmp_count, n;
+	struct swap_info_struct *p;
+	struct page *page;
+	pgoff_t offset;
+	unsigned char *map;
+
+	p = swap_info_get(entry);
+	if (!p)
+		return 0;
+
+	count = swap_count(p->swap_map[swp_offset(entry)]);
+	if (!(count & COUNT_CONTINUED))
+		goto out;
+
+	count &= ~COUNT_CONTINUED;
+	n = SWAP_MAP_MAX + 1;
+
+	offset = swp_offset(entry);
+	page = vmalloc_to_page(p->swap_map + offset);
+	offset &= ~PAGE_MASK;
+	VM_BUG_ON(page_private(page) != SWP_CONTINUED);
+
+	do {
+		page = list_entry(page->lru.next, struct page, lru);
+		map = kmap_atomic(page);
+		tmp_count = map[offset];
+		kunmap_atomic(map);
+
+		count += (tmp_count & ~COUNT_CONTINUED) * n;
+		n *= (SWAP_CONT_MAX + 1);
+	} while (tmp_count & COUNT_CONTINUED);
+out:
+	spin_unlock(&p->lock);
 	return count;
 }
 
@@ -1677,7 +1653,7 @@ sector_t map_swap_page(struct page *page, struct block_device **bdev)
 {
 	swp_entry_t entry;
 	entry.val = page_private(page);
-	return map_swap_entry(entry, bdev);
+	return map_swap_entry(entry, bdev) << (PAGE_SHIFT - 9);
 }
 
 /*
@@ -2250,6 +2226,8 @@ static unsigned long read_swap_header(struct swap_info_struct *p,
 		swab32s(&swap_header->info.version);
 		swab32s(&swap_header->info.last_page);
 		swab32s(&swap_header->info.nr_badpages);
+		if (swap_header->info.nr_badpages > MAX_SWAP_BADPAGES)
+			return 0;
 		for (i = 0; i < swap_header->info.nr_badpages; i++)
 			swab32s(&swap_header->info.badpages[i]);
 	}
@@ -2281,6 +2259,10 @@ static unsigned long read_swap_header(struct swap_info_struct *p,
 	maxpages = swp_offset(pte_to_swp_entry(
 			swp_entry_to_pte(swp_entry(0, ~0UL)))) + 1;
 	last_page = swap_header->info.last_page;
+	if (!last_page) {
+		pr_warn("Empty swap-file\n");
+		return 0;
+	}
 	if (last_page > maxpages) {
 		pr_warn("Truncating oversized swap area, only using %luk out of %luk\n",
 			maxpages << (PAGE_SHIFT - 10),

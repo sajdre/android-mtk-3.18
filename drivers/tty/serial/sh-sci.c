@@ -171,18 +171,17 @@ static struct plat_sci_reg sci_regmap[SCIx_NR_REGTYPES][SCIx_NR_REGS] = {
 	},
 
 	/*
-	 * Common definitions for legacy IrDA ports, dependent on
-	 * regshift value.
+	 * Common definitions for legacy IrDA ports.
 	 */
 	[SCIx_IRDA_REGTYPE] = {
 		[SCSMR]		= { 0x00,  8 },
-		[SCBRR]		= { 0x01,  8 },
-		[SCSCR]		= { 0x02,  8 },
-		[SCxTDR]	= { 0x03,  8 },
-		[SCxSR]		= { 0x04,  8 },
-		[SCxRDR]	= { 0x05,  8 },
-		[SCFCR]		= { 0x06,  8 },
-		[SCFDR]		= { 0x07, 16 },
+		[SCBRR]		= { 0x02,  8 },
+		[SCSCR]		= { 0x04,  8 },
+		[SCxTDR]	= { 0x06,  8 },
+		[SCxSR]		= { 0x08, 16 },
+		[SCxRDR]	= { 0x0a,  8 },
+		[SCFCR]		= { 0x0c,  8 },
+		[SCFDR]		= { 0x0e, 16 },
 		[SCTFDR]	= sci_reg_invalid,
 		[SCRFDR]	= sci_reg_invalid,
 		[SCSPTR]	= sci_reg_invalid,
@@ -737,6 +736,8 @@ static void sci_receive_chars(struct uart_port *port)
 		/* Tell the rest of the system the news. New characters! */
 		tty_flip_buffer_push(tport);
 	} else {
+		/* TTY buffers full; read from RX reg to prevent lockup */
+		serial_port_in(port, SCxRDR);
 		serial_port_in(port, SCxSR); /* dummy read */
 		serial_port_out(port, SCxSR, SCxSR_RDxF_CLEAR(port));
 	}
@@ -1734,11 +1735,13 @@ static int sci_startup(struct uart_port *port)
 
 	dev_dbg(port->dev, "%s(%d)\n", __func__, port->line);
 
-	ret = sci_request_irq(s);
-	if (unlikely(ret < 0))
-		return ret;
-
 	sci_request_dma(port);
+
+	ret = sci_request_irq(s);
+	if (unlikely(ret < 0)) {
+		sci_free_dma(port);
+		return ret;
+	}
 
 	spin_lock_irqsave(&port->lock, flags);
 	sci_start_tx(port);
@@ -1760,8 +1763,8 @@ static void sci_shutdown(struct uart_port *port)
 	sci_stop_tx(port);
 	spin_unlock_irqrestore(&port->lock, flags);
 
-	sci_free_dma(port);
 	sci_free_irq(s);
+	sci_free_dma(port);
 }
 
 static unsigned int sci_scbrr_calc(struct sci_port *s, unsigned int bps,
@@ -2311,13 +2314,12 @@ static void serial_console_write(struct console *co, const char *s,
 	unsigned long flags;
 	int locked = 1;
 
-	local_irq_save(flags);
 	if (port->sysrq)
 		locked = 0;
 	else if (oops_in_progress)
-		locked = spin_trylock(&port->lock);
+		locked = spin_trylock_irqsave(&port->lock, flags);
 	else
-		spin_lock(&port->lock);
+		spin_lock_irqsave(&port->lock, flags);
 
 	/* first save the SCSCR then disable the interrupts */
 	ctrl = serial_port_in(port, SCSCR);
@@ -2334,8 +2336,7 @@ static void serial_console_write(struct console *co, const char *s,
 	serial_port_out(port, SCSCR, ctrl);
 
 	if (locked)
-		spin_unlock(&port->lock);
-	local_irq_restore(flags);
+		spin_unlock_irqrestore(&port->lock, flags);
 }
 
 static int serial_console_setup(struct console *co, char *options)

@@ -1205,8 +1205,8 @@ static int st_open(struct inode *inode, struct file *filp)
 	spin_lock(&st_use_lock);
 	if (STp->in_use) {
 		spin_unlock(&st_use_lock);
-		scsi_tape_put(STp);
 		DEBC_printk(STp, "Device already in use.\n");
+		scsi_tape_put(STp);
 		return (-EBUSY);
 	}
 
@@ -1266,9 +1266,9 @@ static int st_open(struct inode *inode, struct file *filp)
 	spin_lock(&st_use_lock);
 	STp->in_use = 0;
 	spin_unlock(&st_use_lock);
-	scsi_tape_put(STp);
 	if (resumed)
 		scsi_autopm_put_device(STp->device);
+	scsi_tape_put(STp);
 	return retval;
 
 }

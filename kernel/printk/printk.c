@@ -59,7 +59,6 @@
 extern void printascii(char *);
 #endif
 
-static DEFINE_PER_CPU(char, printk_state);
 int console_printk[4] = {
 	CONSOLE_LOGLEVEL_DEFAULT,	/* console_loglevel */
 	MESSAGE_LOGLEVEL_DEFAULT,	/* default_message_loglevel */
@@ -246,12 +245,12 @@ static enum log_flags syslog_prev;
 static size_t syslog_partial;
 
 /* index and sequence number of the first record stored in the buffer */
-u64 log_first_seq;
-u32 log_first_idx;
+static u64 log_first_seq;
+static u32 log_first_idx;
 
 /* index and sequence number of the next record to store in the buffer */
-u64 log_next_seq;
-u32 log_next_idx;
+static u64 log_next_seq;
+static u32 log_next_idx;
 
 /* the next printk record to write to the console */
 static u64 console_seq;
@@ -272,16 +271,10 @@ static u32 clear_idx;
 #define LOG_ALIGN __alignof__(struct printk_log)
 #endif
 #define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
+#define LOG_BUF_LEN_MAX (u32)(1 << 31)
 static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
 static char *log_buf = __log_buf;
 static u32 log_buf_len = __LOG_BUF_LEN;
-
-bool is_logbuf_lock(raw_spinlock_t *lock)
-{
-	if (lock == &logbuf_lock)
-		return true;
-	return false;
-}
 
 /* Return log buffer address */
 char *log_buf_addr_get(void)
@@ -428,24 +421,9 @@ static int log_store(int facility, int level,
 	struct printk_log *msg;
 	u32 size, pad_len;
 	u16 trunc_msg_len = 0;
-	int this_cpu = smp_processor_id();
-	char state = __raw_get_cpu_var(printk_state);
-	char tbuf[50];
-	unsigned tlen;
-
-	if (state == 0) {
-		__raw_get_cpu_var(printk_state) = ' ';
-		state = ' ';
-	}
-
-	if (console_suspended == 0)
-		tlen = snprintf(tbuf, sizeof(tbuf), "%c(%x)[%d:%s]", state, this_cpu, current->pid, current->comm);
-	else
-		tlen = snprintf(tbuf, sizeof(tbuf), "%c%x)", state, this_cpu);
-
 
 	/* number of '\0' padding bytes to next message */
-	size = msg_used_size(text_len + tlen, dict_len, &pad_len);
+	size = msg_used_size(text_len, dict_len, &pad_len);
 
 	if (log_make_free_space(size)) {
 		/* truncate the message if it is too long for empty buffer */
@@ -468,12 +446,7 @@ static int log_store(int facility, int level,
 
 	/* fill message */
 	msg = (struct printk_log *)(log_buf + log_next_idx);
-	memcpy(log_text(msg), tbuf, tlen);
-	if (tlen + text_len > LOG_LINE_MAX)
-		text_len = LOG_LINE_MAX - tlen;
-
-	memcpy(log_text(msg) + tlen, text, text_len);
-	text_len += tlen;
+	memcpy(log_text(msg), text, text_len);
 	msg->text_len = text_len;
 	if (trunc_msg_len) {
 		memcpy(log_text(msg) + text_len, trunc_msg, trunc_msg_len);
@@ -519,11 +492,11 @@ static int check_syslog_permissions(int type, bool from_file)
 	 * already done the capabilities checks at open time.
 	 */
 	if (from_file && type != SYSLOG_ACTION_OPEN)
-		return 0;
+		goto ok;
 
 	if (syslog_action_restricted(type)) {
 		if (capable(CAP_SYSLOG))
-			return 0;
+			goto ok;
 		/*
 		 * For historical reasons, accept CAP_SYS_ADMIN too, with
 		 * a warning.
@@ -533,10 +506,11 @@ static int check_syslog_permissions(int type, bool from_file)
 				     "CAP_SYS_ADMIN but no CAP_SYSLOG "
 				     "(deprecated).\n",
 				 current->comm, task_pid_nr(current));
-			return 0;
+			goto ok;
 		}
 		return -EPERM;
 	}
+ok:
 	return security_syslog(type);
 }
 
@@ -864,18 +838,28 @@ void log_buf_kexec_setup(void)
 static unsigned long __initdata new_log_buf_len;
 
 /* we practice scaling the ring buffer by powers of 2 */
-static void __init log_buf_len_update(unsigned size)
+static void __init log_buf_len_update(u64 size)
 {
+	if (size > (u64)LOG_BUF_LEN_MAX) {
+		size = (u64)LOG_BUF_LEN_MAX;
+		pr_err("log_buf over 2G is not supported.\n");
+	}
+
 	if (size)
 		size = roundup_pow_of_two(size);
 	if (size > log_buf_len)
-		new_log_buf_len = size;
+		new_log_buf_len = (unsigned long)size;
 }
 
 /* save requested log_buf_len since it's too early to process it */
 static int __init log_buf_len_setup(char *str)
 {
-	unsigned size = memparse(str, &str);
+	u64 size;
+
+	if (!str)
+		return -EINVAL;
+
+	size = memparse(str, &str);
 
 	log_buf_len_update(size);
 
@@ -920,7 +904,7 @@ void __init setup_log_buf(int early)
 {
 	unsigned long flags;
 	char *new_log_buf;
-	int free;
+	unsigned int free;
 
 	if (log_buf != __log_buf)
 		return;
@@ -940,7 +924,7 @@ void __init setup_log_buf(int early)
 	}
 
 	if (unlikely(!new_log_buf)) {
-		pr_err("log_buf_len: %ld bytes not available\n",
+		pr_err("log_buf_len: %lu bytes not available\n",
 			new_log_buf_len);
 		return;
 	}
@@ -953,8 +937,8 @@ void __init setup_log_buf(int early)
 	memcpy(log_buf, __log_buf, __LOG_BUF_LEN);
 	raw_spin_unlock_irqrestore(&logbuf_lock, flags);
 
-	pr_info("log_buf_len: %d bytes\n", log_buf_len);
-	pr_info("early log buf free: %d(%d%%)\n",
+	pr_info("log_buf_len: %u bytes\n", log_buf_len);
+	pr_info("early log buf free: %u(%u%%)\n",
 		free, (free * 100) / __LOG_BUF_LEN);
 }
 
@@ -1298,10 +1282,6 @@ int do_syslog(int type, char __user *buf, int len, bool from_file)
 	if (error)
 		goto out;
 
-	error = security_syslog(type);
-	if (error)
-		return error;
-
 	switch (type) {
 	case SYSLOG_ACTION_CLOSE:	/* Close log */
 		break;
@@ -1432,7 +1412,7 @@ static void call_console_drivers(int level, const char *text, size_t len)
 {
 	struct console *con;
 
-	trace_console(text, len);
+	trace_console_rcuidle(text, len);
 
 	if (level >= console_loglevel && !ignore_loglevel)
 		return;
@@ -1658,11 +1638,8 @@ asmlinkage int vprintk_emit(int facility, int level,
 	int this_cpu;
 	int printed_len = 0;
 	bool in_sched = false;
-	int in_irq_disable;
 	/* cpu currently holding logbuf_lock in this function */
 	static volatile unsigned int logbuf_cpu = UINT_MAX;
-
-	in_irq_disable = irqs_disabled();
 
 	if (level == SCHED_MESSAGE_LOGLEVEL) {
 		level = -1;
@@ -1754,16 +1731,6 @@ asmlinkage int vprintk_emit(int facility, int level,
 
 	if (dict)
 		lflags |= LOG_PREFIX|LOG_NEWLINE;
-#ifdef CONFIG_PRINTK_PROCESS_INFO
-	if (in_irq_disable)
-		__raw_get_cpu_var(printk_state) = '-';
-#ifdef CONFIG_MT_PRINTK_UART_CONSOLE
-	else if (printk_disable_uart == 0)
-		__raw_get_cpu_var(printk_state) = '.';
-#endif
-	else
-		__raw_get_cpu_var(printk_state) = ' ';
-#endif
 
 	if (!(lflags & LOG_NEWLINE)) {
 		/*
@@ -1989,6 +1956,9 @@ static int __init console_setup(char *str)
 	char buf[sizeof(console_cmdline[0].name) + 4]; /* 4 for "ttyS" */
 	char *s, *options, *brl_options = NULL;
 	int idx;
+
+	if (str[0] == 0)
+		return 1;
 
 	if (_braille_console_setup(&str, &brl_options))
 		return 1;
@@ -2219,13 +2189,24 @@ void console_unlock(void)
 	static u64 seen_seq;
 	unsigned long flags;
 	bool wake_klogd = false;
-	bool retry;
+	bool do_cond_resched, retry;
 
 	if (console_suspended) {
 		up_console_sem();
 		return;
 	}
 
+	/*
+	 * Console drivers are called under logbuf_lock, so
+	 * @console_may_schedule should be cleared before; however, we may
+	 * end up dumping a lot of lines, for example, if called from
+	 * console registration path, and should invoke cond_resched()
+	 * between lines if allowable.  Not doing so can cause a very long
+	 * scheduling stall on a slow console leading to RCU stall and
+	 * softlockup warnings which exacerbate the issue with more
+	 * messages practically incapacitating the system.
+	 */
+	do_cond_resched = console_may_schedule;
 	console_may_schedule = 0;
 
 	/* flush buffered message fragment immediately to console */
@@ -2287,6 +2268,9 @@ skip:
 		call_console_drivers(level, text, len);
 		start_critical_timings();
 		local_irq_restore(flags);
+
+		if (do_cond_resched)
+			cond_resched();
 	}
 	console_locked = 0;
 
@@ -2351,6 +2335,25 @@ void console_unblank(void)
 	for_each_console(c)
 		if ((c->flags & CON_ENABLED) && c->unblank)
 			c->unblank();
+	console_unlock();
+}
+
+/**
+ * console_flush_on_panic - flush console content on panic
+ *
+ * Immediately output all pending messages no matter what.
+ */
+void console_flush_on_panic(void)
+{
+	/*
+	 * If someone else is holding the console lock, trylock will fail
+	 * and may_schedule may be set.  Ignore and proceed to unlock so
+	 * that messages are flushed out.  As this can be called from any
+	 * context and we don't want to get preempted while flushing,
+	 * ensure may_schedule is cleared.
+	 */
+	console_trylock();
+	console_may_schedule = 0;
 	console_unlock();
 }
 
@@ -2977,7 +2980,7 @@ bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
 	seq = dumper->cur_seq;
 	idx = dumper->cur_idx;
 	prev = 0;
-	while (l > size && seq < dumper->next_seq) {
+	while (l >= size && seq < dumper->next_seq) {
 		struct printk_log *msg = log_from_idx(idx);
 
 		l -= msg_print_text(msg, prev, true, NULL, 0);
@@ -3107,10 +3110,4 @@ void show_regs_print_info(const char *log_lvl)
 	       task_thread_info(current));
 }
 
-void get_kernel_log_buffer(unsigned long *addr, unsigned long *size, unsigned long *start)
-{
-	*addr = (unsigned long)log_buf;
-	*size = log_buf_len;
-	*start = (unsigned long)&log_first_idx;
-}
 #endif

@@ -387,7 +387,8 @@ struct qdisc_rate_table *qdisc_get_rtab(struct tc_ratespec *r, struct nlattr *ta
 {
 	struct qdisc_rate_table *rtab;
 
-	if (tab == NULL || r->rate == 0 || r->cell_log == 0 ||
+	if (tab == NULL || r->rate == 0 ||
+	    r->cell_log == 0 || r->cell_log >= 32 ||
 	    nla_len(tab) != TC_RTAB_SIZE)
 		return NULL;
 
@@ -740,14 +741,15 @@ static u32 qdisc_alloc_handle(struct net_device *dev)
 	return 0;
 }
 
-void qdisc_tree_decrease_qlen(struct Qdisc *sch, unsigned int n)
+void qdisc_tree_reduce_backlog(struct Qdisc *sch, unsigned int n,
+			       unsigned int len)
 {
 	const struct Qdisc_class_ops *cops;
 	unsigned long cl;
 	u32 parentid;
 	int drops;
 
-	if (n == 0)
+	if (n == 0 && len == 0)
 		return;
 	drops = max_t(int, n, 0);
 	while ((parentid = sch->parent)) {
@@ -766,10 +768,11 @@ void qdisc_tree_decrease_qlen(struct Qdisc *sch, unsigned int n)
 			cops->put(sch, cl);
 		}
 		sch->q.qlen -= n;
+		sch->qstats.backlog -= len;
 		__qdisc_qstats_drop(sch, drops);
 	}
 }
-EXPORT_SYMBOL(qdisc_tree_decrease_qlen);
+EXPORT_SYMBOL(qdisc_tree_reduce_backlog);
 
 static void notify_and_destroy(struct net *net, struct sk_buff *skb,
 			       struct nlmsghdr *n, u32 clid,
@@ -993,6 +996,9 @@ qdisc_create(struct net_device *dev, struct netdev_queue *dev_queue,
 
 		return sch;
 	}
+	/* ops->init() failed, we call ->destroy() like qdisc_create_dflt() */
+	if (ops->destroy)
+		ops->destroy(sch);
 err_out3:
 	dev_put(dev);
 	kfree((char *) sch - sch->padded);

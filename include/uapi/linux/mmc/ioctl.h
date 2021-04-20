@@ -2,6 +2,7 @@
 #define LINUX_MMC_IOCTL_H
 
 #include <linux/types.h>
+#include <linux/major.h>
 
 struct mmc_ioc_cmd {
 	/* Implies direction of data.  true = write, false = read */
@@ -46,7 +47,6 @@ struct mmc_ioc_cmd {
 #define mmc_ioc_cmd_set_data(ic, ptr) ic.data_ptr = (__u64)(unsigned long) ptr
 
 #define MMC_IOC_CMD _IOWR(MMC_BLOCK_MAJOR, 0, struct mmc_ioc_cmd)
-#define MMC_IOC_FFU_CMD _IOWR(MMC_BLOCK_MAJOR, 1, struct mmc_ioc_cmd)
 
 /*
  * Since this ioctl is only meant to enhance (and not replace) normal access
@@ -55,5 +55,4 @@ struct mmc_ioc_cmd {
  * block device operations.
  */
 #define MMC_IOC_MAX_BYTES  (512L * 256)
-#define MMC_FFU_IOC_MAX_BYTES  (512L * 1024)
 #endif /* LINUX_MMC_IOCTL_H */

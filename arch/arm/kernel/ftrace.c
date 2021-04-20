@@ -15,6 +15,7 @@
 #include <linux/ftrace.h>
 #include <linux/uaccess.h>
 #include <linux/module.h>
+#include <linux/stop_machine.h>
 
 #include <asm/cacheflush.h>
 #include <asm/opcodes.h>
@@ -29,6 +30,23 @@
 #endif
 
 #ifdef CONFIG_DYNAMIC_FTRACE
+
+static int __ftrace_modify_code(void *data)
+{
+	int *command = data;
+
+	set_kernel_text_rw();
+	ftrace_modify_all_code(*command);
+	set_kernel_text_ro();
+
+	return 0;
+}
+
+void arch_ftrace_update_code(int command)
+{
+	stop_machine(__ftrace_modify_code, &command, NULL);
+}
+
 #ifdef CONFIG_OLD_MCOUNT
 #define OLD_MCOUNT_ADDR	((unsigned long) mcount)
 #define OLD_FTRACE_ADDR ((unsigned long) ftrace_caller_old)
@@ -73,6 +91,8 @@ int ftrace_arch_code_modify_prepare(void)
 int ftrace_arch_code_modify_post_process(void)
 {
 	set_all_modules_text_ro();
+	/* Make sure any TLB misses during machine stop are cleared. */
+	flush_tlb_all();
 	return 0;
 }
 

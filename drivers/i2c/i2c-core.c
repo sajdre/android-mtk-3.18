@@ -24,6 +24,7 @@
    (c) 2013  Wolfram Sang <wsa@the-dreams.de>
    I2C ACPI code Copyright (C) 2014 Intel Corp
    Author: Lan Tianyu <tianyu.lan@intel.com>
+   I2C slave support (c) 2014 by Wolfram Sang <wsa@sang-engineering.com>
  */
 
 #include <linux/module.h>
@@ -1833,6 +1834,7 @@ int i2c_register_driver(struct module *owner, struct i2c_driver *driver)
 	/* add the driver to the list of i2c drivers in the driver core */
 	driver->driver.owner = owner;
 	driver->driver.bus = &i2c_bus_type;
+	INIT_LIST_HEAD(&driver->clients);
 
 	/* When registration returns, the driver core
 	 * will have called probe() for all matching-but-unbound devices.
@@ -1851,7 +1853,6 @@ int i2c_register_driver(struct module *owner, struct i2c_driver *driver)
 
 	pr_debug("i2c-core: driver [%s] registered\n", driver->driver.name);
 
-	INIT_LIST_HEAD(&driver->clients);
 	/* Walk the adapters that are already present */
 	i2c_for_each_dev(driver, __process_new_driver);
 
@@ -1993,65 +1994,6 @@ module_exit(i2c_exit);
  * ----------------------------------------------------
  */
 
-/* Check if val is exceeding the quirk IFF quirk is non 0 */
-#define i2c_quirk_exceeded(val, quirk) ((quirk) && ((val) > (quirk)))
-
-static int i2c_quirk_error(struct i2c_adapter *adap, struct i2c_msg *msg, char *err_msg)
-{
-	dev_err_ratelimited(&adap->dev, "adapter quirk: %s (addr 0x%04x, size %u, %s)\n",
-			    err_msg, msg->addr, msg->len,
-			    msg->flags & I2C_M_RD ? "read" : "write");
-	return -EOPNOTSUPP;
-}
-
-static int i2c_check_for_quirks(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
-{
-	const struct i2c_adapter_quirks *q = adap->quirks;
-	int max_num = q->max_num_msgs, i;
-	bool do_len_check = true;
-
-	if (q->flags & I2C_AQ_COMB) {
-		max_num = 2;
-
-		/* special checks for combined messages */
-		if (num == 2) {
-			if (q->flags & I2C_AQ_COMB_WRITE_FIRST && msgs[0].flags & I2C_M_RD)
-				return i2c_quirk_error(adap, &msgs[0], "1st comb msg must be write");
-
-			if (q->flags & I2C_AQ_COMB_READ_SECOND && !(msgs[1].flags & I2C_M_RD))
-				return i2c_quirk_error(adap, &msgs[1], "2nd comb msg must be read");
-
-			if (q->flags & I2C_AQ_COMB_SAME_ADDR && msgs[0].addr != msgs[1].addr)
-				return i2c_quirk_error(adap, &msgs[0], "comb msg only to same addr");
-
-			if (i2c_quirk_exceeded(msgs[0].len, q->max_comb_1st_msg_len))
-				return i2c_quirk_error(adap, &msgs[0], "msg too long");
-
-			if (i2c_quirk_exceeded(msgs[1].len, q->max_comb_2nd_msg_len))
-				return i2c_quirk_error(adap, &msgs[1], "msg too long");
-
-			do_len_check = false;
-		}
-	}
-
-	if (i2c_quirk_exceeded(num, max_num))
-		return i2c_quirk_error(adap, &msgs[0], "too many messages");
-
-	for (i = 0; i < num; i++) {
-		u16 len = msgs[i].len;
-
-		if (msgs[i].flags & I2C_M_RD) {
-			if (do_len_check && i2c_quirk_exceeded(len, q->max_read_len))
-				return i2c_quirk_error(adap, &msgs[i], "msg too long");
-		} else {
-			if (do_len_check && i2c_quirk_exceeded(len, q->max_write_len))
-				return i2c_quirk_error(adap, &msgs[i], "msg too long");
-		}
-	}
-
-	return 0;
-}
-
 /**
  * __i2c_transfer - unlocked flavor of i2c_transfer
  * @adap: Handle to I2C bus
@@ -2068,9 +2010,6 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
 	unsigned long orig_jiffies;
 	int ret, try;
-
-	if (adap->quirks && i2c_check_for_quirks(adap, msgs, num))
-		return -EOPNOTSUPP;
 
 	/* i2c_trace_msg gets enabled when tracepoint i2c_transfer gets
 	 * enabled.  This is an efficient way of keeping the for-loop from
@@ -2824,16 +2763,16 @@ static s32 i2c_smbus_xfer_emulated(struct i2c_adapter *adapter, u16 addr,
 				   the underlying bus driver */
 		break;
 	case I2C_SMBUS_I2C_BLOCK_DATA:
+		if (data->block[0] > I2C_SMBUS_BLOCK_MAX) {
+			dev_err(&adapter->dev, "Invalid block %s size %d\n",
+				read_write == I2C_SMBUS_READ ? "read" : "write",
+				data->block[0]);
+			return -EINVAL;
+		}
 		if (read_write == I2C_SMBUS_READ) {
 			msg[1].len = data->block[0];
 		} else {
 			msg[0].len = data->block[0] + 1;
-			if (msg[0].len > I2C_SMBUS_BLOCK_MAX + 1) {
-				dev_err(&adapter->dev,
-					"Invalid block write size %d\n",
-					data->block[0]);
-				return -EINVAL;
-			}
 			for (i = 1; i <= data->block[0]; i++)
 				msgbuf0[i] = data->block[i];
 		}
@@ -2963,6 +2902,54 @@ trace:
 	return res;
 }
 EXPORT_SYMBOL(i2c_smbus_xfer);
+
+int i2c_slave_register(struct i2c_client *client, i2c_slave_cb_t slave_cb)
+{
+	int ret;
+
+	if (!client || !slave_cb)
+		return -EINVAL;
+
+	if (!(client->flags & I2C_CLIENT_TEN)) {
+		/* Enforce stricter address checking */
+		ret = i2c_check_addr_validity(client->addr);
+		if (ret)
+			return ret;
+	}
+
+	if (!client->adapter->algo->reg_slave)
+		return -EOPNOTSUPP;
+
+	client->slave_cb = slave_cb;
+
+	i2c_lock_adapter(client->adapter);
+	ret = client->adapter->algo->reg_slave(client);
+	i2c_unlock_adapter(client->adapter);
+
+	if (ret)
+		client->slave_cb = NULL;
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(i2c_slave_register);
+
+int i2c_slave_unregister(struct i2c_client *client)
+{
+	int ret;
+
+	if (!client->adapter->algo->unreg_slave)
+		return -EOPNOTSUPP;
+
+	i2c_lock_adapter(client->adapter);
+	ret = client->adapter->algo->unreg_slave(client);
+	i2c_unlock_adapter(client->adapter);
+
+	if (ret == 0)
+		client->slave_cb = NULL;
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(i2c_slave_unregister);
 
 MODULE_AUTHOR("Simon G. Vogl <simon@tk.uni-linz.ac.at>");
 MODULE_DESCRIPTION("I2C-Bus main module");

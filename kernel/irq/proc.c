@@ -12,6 +12,7 @@
 #include <linux/seq_file.h>
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
+#include <linux/mutex.h>
 
 #include "internals.h"
 
@@ -240,44 +241,6 @@ static const struct file_operations default_affinity_proc_fops = {
 	.write		= default_affinity_write,
 };
 
-#ifdef CONFIG_MTK_IRQ_NEW_DESIGN
-static int irq_need_migrate_list_show(struct seq_file *m, void *v)
-{
-	struct per_cpu_irq_desc *node;
-	struct list_head *pos, *temp;
-	int cpu;
-
-	rcu_read_lock();
-	for_each_cpu(cpu, cpu_possible_mask) {
-		seq_printf(m, "dump per-cpu irq-need-migrate list of CPU%u\n", cpu);
-		list_for_each_safe(pos, temp, &(irq_need_migrate_list[cpu].list)) {
-			node = list_entry_rcu(pos, struct per_cpu_irq_desc, list);
-			seq_printf(m, "IRQ %d\n", (node->desc->irq_data).irq);
-		}
-	}
-	rcu_read_unlock();
-	return 0;
-}
-
-static int irq_need_migrate_list_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, irq_need_migrate_list_show, PDE_DATA(inode));
-}
-
-static const struct file_operations irq_need_migrate_list_fops = {
-	.open		= irq_need_migrate_list_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static void register_irq_need_migrate_list_proc(void)
-{
-	proc_create("irq/dump_irq_need_migrate_list", 0400, NULL,
-		    &irq_need_migrate_list_fops);
-}
-#endif
-
 static int irq_node_proc_show(struct seq_file *m, void *v)
 {
 	struct irq_desc *desc = irq_to_desc((long) m->private);
@@ -364,10 +327,21 @@ void register_handler_proc(unsigned int irq, struct irqaction *action)
 
 void register_irq_proc(unsigned int irq, struct irq_desc *desc)
 {
+	static DEFINE_MUTEX(register_lock);
 	char name [MAX_NAMELEN];
 
-	if (!root_irq_dir || (desc->irq_data.chip == &no_irq_chip) || desc->dir)
+	if (!root_irq_dir || (desc->irq_data.chip == &no_irq_chip))
 		return;
+
+	/*
+	 * irq directories are registered only when a handler is
+	 * added, not when the descriptor is created, so multiple
+	 * tasks might try to register at the same time.
+	 */
+	mutex_lock(&register_lock);
+
+	if (desc->dir)
+		goto out_unlock;
 
 	memset(name, 0, MAX_NAMELEN);
 	sprintf(name, "%d", irq);
@@ -375,7 +349,7 @@ void register_irq_proc(unsigned int irq, struct irq_desc *desc)
 	/* create /proc/irq/1234 */
 	desc->dir = proc_mkdir(name, root_irq_dir);
 	if (!desc->dir)
-		return;
+		goto out_unlock;
 
 #ifdef CONFIG_SMP
 	/* create /proc/irq/<irq>/smp_affinity */
@@ -396,6 +370,9 @@ void register_irq_proc(unsigned int irq, struct irq_desc *desc)
 
 	proc_create_data("spurious", 0444, desc->dir,
 			 &irq_spurious_proc_fops, (void *)(long)irq);
+
+out_unlock:
+	mutex_unlock(&register_lock);
 }
 
 void unregister_irq_proc(unsigned int irq, struct irq_desc *desc)
@@ -443,10 +420,6 @@ void init_irq_proc(void)
 		return;
 
 	register_default_affinity_proc();
-
-#ifdef CONFIG_MTK_IRQ_NEW_DESIGN
-	register_irq_need_migrate_list_proc();
-#endif
 
 	/*
 	 * Create entries for all existing IRQs.

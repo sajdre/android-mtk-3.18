@@ -110,6 +110,11 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 					  struct device *dev,
 					  const char *supply_name);
 
+static struct regulator_dev *dev_to_rdev(struct device *dev)
+{
+	return container_of(dev, struct regulator_dev, dev);
+}
+
 static const char *rdev_get_name(struct regulator_dev *rdev)
 {
 	if (rdev->constraints && rdev->constraints->name)
@@ -995,32 +1000,31 @@ static int set_machine_constraints(struct regulator_dev *rdev,
 
 	ret = machine_constraints_voltage(rdev, rdev->constraints);
 	if (ret != 0)
-		goto out;
+		return ret;
 
 	ret = machine_constraints_current(rdev, rdev->constraints);
 	if (ret != 0)
-		goto out;
+		return ret;
 
 	/* do we need to setup our suspend state */
 	if (rdev->constraints->initial_state) {
 		ret = suspend_prepare(rdev, rdev->constraints->initial_state);
 		if (ret < 0) {
 			rdev_err(rdev, "failed to set suspend state\n");
-			goto out;
+			return ret;
 		}
 	}
 
 	if (rdev->constraints->initial_mode) {
 		if (!ops->set_mode) {
 			rdev_err(rdev, "no set_mode operation\n");
-			ret = -EINVAL;
-			goto out;
+			return -EINVAL;
 		}
 
 		ret = ops->set_mode(rdev, rdev->constraints->initial_mode);
 		if (ret < 0) {
 			rdev_err(rdev, "failed to set initial mode: %d\n", ret);
-			goto out;
+			return ret;
 		}
 	}
 
@@ -1031,7 +1035,7 @@ static int set_machine_constraints(struct regulator_dev *rdev,
 		ret = _regulator_do_enable(rdev);
 		if (ret < 0 && ret != -EINVAL) {
 			rdev_err(rdev, "failed to enable\n");
-			goto out;
+			return ret;
 		}
 	}
 
@@ -1040,16 +1044,12 @@ static int set_machine_constraints(struct regulator_dev *rdev,
 		ret = ops->set_ramp_delay(rdev, rdev->constraints->ramp_delay);
 		if (ret < 0) {
 			rdev_err(rdev, "failed to set ramp_delay\n");
-			goto out;
+			return ret;
 		}
 	}
 
 	print_constraints(rdev);
 	return 0;
-out:
-	kfree(rdev->constraints);
-	rdev->constraints = NULL;
-	return ret;
 }
 
 /**
@@ -1715,6 +1715,8 @@ static void regulator_ena_gpio_free(struct regulator_dev *rdev)
 				gpiod_put(pin->gpiod);
 				list_del(&pin->list);
 				kfree(pin);
+				rdev->ena_pin = NULL;
+				return;
 			} else {
 				pin->request_count--;
 			}
@@ -3742,7 +3744,7 @@ scrub:
 	if (rdev->supply)
 		_regulator_put(rdev->supply);
 	regulator_ena_gpio_free(rdev);
-	kfree(rdev->constraints);
+
 wash:
 	device_unregister(&rdev->dev);
 	/* device core frees rdev */
@@ -3994,13 +3996,57 @@ static int __init regulator_init(void)
 /* init early to allow our consumers to complete system booting */
 core_initcall(regulator_init);
 
-static int __init regulator_init_complete(void)
+static int __init regulator_late_cleanup(struct device *dev, void *data)
 {
-	struct regulator_dev *rdev;
-	const struct regulator_ops *ops;
-	struct regulation_constraints *c;
+	struct regulator_dev *rdev = dev_to_rdev(dev);
+	const struct regulator_ops *ops = rdev->desc->ops;
+	struct regulation_constraints *c = rdev->constraints;
 	int enabled, ret;
 
+	if (c && c->always_on)
+		return 0;
+
+	if (c && !(c->valid_ops_mask & REGULATOR_CHANGE_STATUS))
+		return 0;
+
+	mutex_lock(&rdev->mutex);
+
+	if (rdev->use_count)
+		goto unlock;
+
+	/* If we can't read the status assume it's on. */
+	if (ops->is_enabled)
+		enabled = ops->is_enabled(rdev);
+	else
+		enabled = 1;
+
+	if (!enabled)
+		goto unlock;
+
+	if (have_full_constraints()) {
+		/* We log since this may kill the system if it goes
+		 * wrong. */
+		rdev_info(rdev, "disabling\n");
+		ret = _regulator_do_disable(rdev);
+		if (ret != 0)
+			rdev_err(rdev, "couldn't disable: %d\n", ret);
+	} else {
+		/* The intention is that in future we will
+		 * assume that full constraints are provided
+		 * so warn even if we aren't going to do
+		 * anything here.
+		 */
+		rdev_warn(rdev, "incomplete constraints, leaving on\n");
+	}
+
+unlock:
+	mutex_unlock(&rdev->mutex);
+
+	return 0;
+}
+
+static int __init regulator_init_complete(void)
+{
 	/*
 	 * Since DT doesn't provide an idiomatic mechanism for
 	 * enabling full constraints and since it's much more natural
@@ -4010,58 +4056,13 @@ static int __init regulator_init_complete(void)
 	if (of_have_populated_dt())
 		has_full_constraints = true;
 
-	mutex_lock(&regulator_list_mutex);
-
 	/* If we have a full configuration then disable any regulators
 	 * we have permission to change the status for and which are
 	 * not in use or always_on.  This is effectively the default
 	 * for DT and ACPI as they have full constraints.
 	 */
-	list_for_each_entry(rdev, &regulator_list, list) {
-		ops = rdev->desc->ops;
-		c = rdev->constraints;
-
-		if (c && c->always_on)
-			continue;
-
-		if (c && !(c->valid_ops_mask & REGULATOR_CHANGE_STATUS))
-			continue;
-
-		mutex_lock(&rdev->mutex);
-
-		if (rdev->use_count)
-			goto unlock;
-
-		/* If we can't read the status assume it's on. */
-		if (ops->is_enabled)
-			enabled = ops->is_enabled(rdev);
-		else
-			enabled = 1;
-
-		if (!enabled)
-			goto unlock;
-
-		if (have_full_constraints()) {
-			/* We log since this may kill the system if it
-			 * goes wrong. */
-			rdev_info(rdev, "disabling\n");
-			ret = _regulator_do_disable(rdev);
-			if (ret != 0)
-				rdev_err(rdev, "couldn't disable: %d\n", ret);
-		} else {
-			/* The intention is that in future we will
-			 * assume that full constraints are provided
-			 * so warn even if we aren't going to do
-			 * anything here.
-			 */
-			rdev_warn(rdev, "incomplete constraints, leaving on\n");
-		}
-
-unlock:
-		mutex_unlock(&rdev->mutex);
-	}
-
-	mutex_unlock(&regulator_list_mutex);
+	class_for_each_device(&regulator_class, NULL, NULL,
+			      regulator_late_cleanup);
 
 	return 0;
 }

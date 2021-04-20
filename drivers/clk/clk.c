@@ -446,7 +446,6 @@ DEFINE_SIMPLE_ATTRIBUTE(freq_stats_fops, freq_stats_get,
 			freq_stats_set, "%llu\n");
 #endif /*CONFIG_COMMON_CLK_FREQ_STATS_ACCOUNTING*/
 
-/* caller must hold prepare_lock */
 static int clk_debug_create_one(struct clk *clk, struct dentry *pdentry)
 {
 	struct dentry *d;
@@ -1833,6 +1832,9 @@ int clk_set_rate(struct clk *clk, unsigned long rate)
 	clk_change_rate(top);
 
 out:
+	/* Always try to update cached phase if possible */
+	if (clk->ops->get_phase)
+		clk->phase = clk->ops->get_phase(clk->hw);
 	clk_prepare_unlock();
 
 	return ret;

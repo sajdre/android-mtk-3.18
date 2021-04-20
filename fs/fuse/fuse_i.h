@@ -241,6 +241,7 @@ struct fuse_io_priv {
 	size_t size;
 	__u64 offset;
 	bool write;
+	bool should_dirty;
 	int err;
 	struct kiocb *iocb;
 	struct file *file;
@@ -350,6 +351,9 @@ struct fuse_req {
 
 	/** Inode used in the request or NULL */
 	struct inode *inode;
+
+	/** Path used for completing d_canonical_path */
+	struct path *canonical_path;
 
 	/** AIO control block */
 	struct fuse_io_priv *io;
@@ -831,6 +835,8 @@ void fuse_ctl_remove_conn(struct fuse_conn *fc);
  */
 int fuse_valid_type(int m);
 
+bool fuse_invalid_attr(struct fuse_attr *attr);
+
 /**
  * Is current process allowed to perform filesystem operation?
  */
@@ -894,7 +900,7 @@ bool fuse_write_update_size(struct inode *inode, loff_t pos);
 int fuse_flush_times(struct inode *inode, struct fuse_file *ff);
 int fuse_write_inode(struct inode *inode, struct writeback_control *wbc);
 
-int fuse_do_setattr(struct inode *inode, struct iattr *attr,
+int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		    struct file *file);
 
 #endif /* _FS_FUSE_I_H */

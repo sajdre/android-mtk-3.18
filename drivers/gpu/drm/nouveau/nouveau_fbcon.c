@@ -178,8 +178,32 @@ nouveau_fbcon_sync(struct fb_info *info)
 	return 0;
 }
 
+static int
+nouveau_fbcon_open(struct fb_info *info, int user)
+{
+	struct nouveau_fbdev *fbcon = info->par;
+	struct nouveau_drm *drm = nouveau_drm(fbcon->dev);
+	int ret = pm_runtime_get_sync(drm->dev->dev);
+	if (ret < 0 && ret != -EACCES) {
+		pm_runtime_put(drm->dev->dev);
+		return ret;
+	}
+	return 0;
+}
+
+static int
+nouveau_fbcon_release(struct fb_info *info, int user)
+{
+	struct nouveau_fbdev *fbcon = info->par;
+	struct nouveau_drm *drm = nouveau_drm(fbcon->dev);
+	pm_runtime_put(drm->dev->dev);
+	return 0;
+}
+
 static struct fb_ops nouveau_fbcon_ops = {
 	.owner = THIS_MODULE,
+	.fb_open = nouveau_fbcon_open,
+	.fb_release = nouveau_fbcon_release,
 	.fb_check_var = drm_fb_helper_check_var,
 	.fb_set_par = drm_fb_helper_set_par,
 	.fb_fillrect = nouveau_fbcon_fillrect,
@@ -195,6 +219,8 @@ static struct fb_ops nouveau_fbcon_ops = {
 
 static struct fb_ops nouveau_fbcon_sw_ops = {
 	.owner = THIS_MODULE,
+	.fb_open = nouveau_fbcon_open,
+	.fb_release = nouveau_fbcon_release,
 	.fb_check_var = drm_fb_helper_check_var,
 	.fb_set_par = drm_fb_helper_set_par,
 	.fb_fillrect = cfb_fillrect,
@@ -211,7 +237,7 @@ void
 nouveau_fbcon_accel_save_disable(struct drm_device *dev)
 {
 	struct nouveau_drm *drm = nouveau_drm(dev);
-	if (drm->fbcon) {
+	if (drm->fbcon && drm->fbcon->helper.fbdev) {
 		drm->fbcon->saved_flags = drm->fbcon->helper.fbdev->flags;
 		drm->fbcon->helper.fbdev->flags |= FBINFO_HWACCEL_DISABLED;
 	}
@@ -221,7 +247,7 @@ void
 nouveau_fbcon_accel_restore(struct drm_device *dev)
 {
 	struct nouveau_drm *drm = nouveau_drm(dev);
-	if (drm->fbcon) {
+	if (drm->fbcon && drm->fbcon->helper.fbdev) {
 		drm->fbcon->helper.fbdev->flags = drm->fbcon->saved_flags;
 	}
 }
@@ -233,7 +259,8 @@ nouveau_fbcon_accel_fini(struct drm_device *dev)
 	struct nouveau_fbdev *fbcon = drm->fbcon;
 	if (fbcon && drm->channel) {
 		console_lock();
-		fbcon->helper.fbdev->flags |= FBINFO_HWACCEL_DISABLED;
+		if (fbcon->helper.fbdev)
+			fbcon->helper.fbdev->flags |= FBINFO_HWACCEL_DISABLED;
 		console_unlock();
 		nouveau_channel_idle(drm->channel);
 		nvif_object_fini(&fbcon->twod);
@@ -522,12 +549,12 @@ nouveau_fbcon_init(struct drm_device *dev)
 
 	ret = drm_fb_helper_init(dev, &fbcon->helper,
 				 dev->mode_config.num_crtc, 4);
-	if (ret) {
-		kfree(fbcon);
-		return ret;
-	}
+	if (ret)
+		goto free;
 
-	drm_fb_helper_single_add_all_connectors(&fbcon->helper);
+	ret = drm_fb_helper_single_add_all_connectors(&fbcon->helper);
+	if (ret)
+		goto fini;
 
 	if (drm->device.info.ram_size <= 32 * 1024 * 1024)
 		preferred_bpp = 8;
@@ -540,8 +567,20 @@ nouveau_fbcon_init(struct drm_device *dev)
 	/* disable all the possible outputs/crtcs before entering KMS mode */
 	drm_helper_disable_unused_functions(dev);
 
-	drm_fb_helper_initial_config(&fbcon->helper, preferred_bpp);
+	ret = drm_fb_helper_initial_config(&fbcon->helper, preferred_bpp);
+	if (ret)
+		goto fini;
+
+	if (fbcon->helper.fbdev)
+		fbcon->helper.fbdev->pixmap.buf_align = 4;
 	return 0;
+
+fini:
+	drm_fb_helper_fini(&fbcon->helper);
+free:
+	kfree(fbcon);
+	drm->fbcon = NULL;
+	return ret;
 }
 
 void
